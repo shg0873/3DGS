@@ -16,54 +16,16 @@ from utils.loss_utils import (
     sobel_edge_weight_map,
 )
 
-try:
-    from fused_ssim import fused_ssim
-
-    FUSED_SSIM_AVAILABLE = True
-except Exception:
-    FUSED_SSIM_AVAILABLE = False
-
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-
-    SPARSE_ADAM_AVAILABLE = True
-except Exception:
-    SPARSE_ADAM_AVAILABLE = False
-
-
-def ensure_model_path(args):
-    # 출력 경로를 사용자가 명시하지 않은 경우, 충돌을 피하기 위해
-    # 간단한 uuid 기반 디렉토리를 자동 생성한다.
-    if args.model_path:
-        return
-    import uuid
-
-    args.model_path = os.path.join("./output/", str(uuid.uuid4())[:10])
-
-
 def train(dataset, opt, pipe, save_iterations, checkpoint_iterations, checkpoint, debug_from):
-    # sparse_adam을 선택했는데 확장 모듈이 없으면 즉시 종료한다.
-    # (중간에 학습이 깨지는 것보다 초기에 명확히 실패시키는 것이 안전)
-    if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
-        sys.exit("sparse_adam is not installed. Please install [3dgs_accel].")
 
-    first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
-    if checkpoint:
-        # 체크포인트가 주어지면 가우시안 상태와 iteration을 복원하여 이어서 학습한다.
-        model_params, first_iter = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
 
-    # 데이터셋 설정(white/black background)에 맞는 고정 배경값.
-    # random_background가 켜지면 iteration마다 override된다.
-    background = torch.tensor([1, 1, 1] if dataset.white_background else [0, 0, 0], dtype=torch.float32, device="cuda")
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
     # 방법 2의 edge 손실 raw 값을 안정적으로 스케일링하기 위한 EMA 버퍼.
     edge_raw_scale_ema = None
 
-    # 훈련 카메라를 셔플 없이 복사해 사용하고, 매 스텝 랜덤 샘플링한다.
+    # 이미지 데이터를 셔플 없이 복사해 사용하고, 매 스텝 랜덤 샘플링한다.
     cams = scene.getTrainCameras().copy()
     cam_indices = list(range(len(cams)))
     first_iter += 1
@@ -97,11 +59,11 @@ def train(dataset, opt, pipe, save_iterations, checkpoint_iterations, checkpoint
         image_for_loss = image
 
         if opt.edge_loss_render_enable and iteration >= opt.edge_loss_render_start_iter:
-            # 방법 3 (Edge-aware render 기반 RGB 손실)
+            # 방법 2 (Edge-aware render 기반 RGB 손실)
             # 1) GT 이미지에서 edge 강도를 추정하고, 각 가우시안 위치에서 edge 가중치를 샘플링
             # 2) r_i = clamp(1 - e_i(1-r_min), r_min, 1) 비율로 scale 축소
             # 3) 축소된 scale로 constrained render를 한 번 더 생성
-            # 4) 옵션에 따라 edge band에서만 base/constrained를 블렌딩해 최종 loss 이미지를 구성
+            # 4) 옵션에 따라 블렌딩해 최종 loss 이미지를 구성
             with torch.no_grad():
                 edge_weights = sample_edge_weights_for_gaussians(
                     viewpoint_cam.original_image.cuda(),
@@ -112,9 +74,10 @@ def train(dataset, opt, pipe, save_iterations, checkpoint_iterations, checkpoint
                     edge_power=opt.edge_loss_render_power,
                 ).clamp(0.0, 1.0)
                 min_ratio = max(0.0, min(1.0, float(opt.edge_loss_render_min_scale_ratio)))
-                # 논문식: edge 강도가 강할수록 축소 비율(ratio)이 작아짐.
+                #  edge 강도가 강할수록 축소 비율(ratio)이 작아짐. r_i = clamp(1 - e_i(1-r_min), r_min, 1)
                 ratio = (1.0 - edge_weights * (1.0 - min_ratio)).clamp(min=min_ratio, max=1.0)
 
+            # edge가 강한 위치의 Gaussian scale을 줄여, 경계 부근에서 퍼짐/번짐을 줄인 렌더링 진행
             constrained_scales = gaussians.get_scaling * ratio.unsqueeze(1)
             loss_render_pkg = render(
                 viewpoint_cam,
@@ -135,21 +98,10 @@ def train(dataset, opt, pipe, save_iterations, checkpoint_iterations, checkpoint
                         power=opt.edge_loss_render_power,
                     )
                     edge_map = (edge_map * float(opt.edge_loss_render_edgeband_strength)).clamp(0.0, 1.0).unsqueeze(0)
-                # edge 영역은 constrained, 비-edge는 base를 더 반영한다.
                 image_for_loss = edge_map * constrained_image + (1.0 - edge_map) * image
             else:
                 # 전 영역에서 constrained render를 loss 입력으로 사용.
                 image_for_loss = constrained_image
-
-            # 방법 3를 사용할 때 densification 기준도 constrained 렌더 결과와 정렬한다.
-            densify_viewspace_points = loss_render_pkg["viewspace_points"]
-            densify_visibility_filter = loss_render_pkg["visibility_filter"]
-
-        if viewpoint_cam.alpha_mask is not None:
-            # alpha 마스크가 있는 데이터셋은 유효 픽셀만 loss에 반영한다.
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
-            image_for_loss *= alpha_mask
 
         # 기본 RGB 재구성 손실 (L1 + DSSIM)
         gt_image = viewpoint_cam.original_image.cuda()
@@ -165,8 +117,8 @@ def train(dataset, opt, pipe, save_iterations, checkpoint_iterations, checkpoint
         w_ssim = (1.0 - w_edge) * opt.lambda_dssim
         loss = w_l1 * l1_val + w_ssim * l_ssim
 
-        # 방법 2 (Edge-aware covariance loss)
-        # 방법 3를 사용하지 않거나, 방법 3와 병행 옵션이 켜진 경우에 활성화된다.
+        # 방법 1(Edge-aware covariance loss)
+        # 방법 2를 사용하지 않는 경우에 활성화.
         use_edge_cov = (not opt.edge_loss_render_enable) or opt.edge_loss_render_with_cov
         if use_edge_cov and iteration >= opt.edge_cov_start_iter:
             # warmup: edge 손실 가중치를 점진적으로 키워 학습 초기 불안정을 완화.
@@ -195,7 +147,6 @@ def train(dataset, opt, pipe, save_iterations, checkpoint_iterations, checkpoint
 
             if opt.edge_cov_auto_norm:
                 # raw edge 손실의 스케일 변동을 EMA로 정규화하여
-                # iteration마다 손실 크기가 급격히 흔들리는 것을 줄인다.
                 if edge_raw_scale_ema is None:
                     edge_raw_scale_ema = l_edge_raw.detach()
                 else:
@@ -208,6 +159,7 @@ def train(dataset, opt, pipe, save_iterations, checkpoint_iterations, checkpoint
             # 최종 총손실: RGB 손실 + 가중된 edge covariance 손실.
             loss = w_l1 * l1_val + w_ssim * l_ssim + (w_edge * l_edge_norm)
 
+        # total loss에 대해 역전파 수행
         loss.backward()
 
         with torch.no_grad():
@@ -252,8 +204,6 @@ def train(dataset, opt, pipe, save_iterations, checkpoint_iterations, checkpoint
 
 
 if __name__ == "__main__":
-    # 원본 train.py의 인자 체계를 최대한 유지하면서,
-    # 본 스크립트는 논문 핵심 학습 루프만 남긴 경량 실행 진입점이다.
     parser = ArgumentParser(description="Minimal training script for paper methods")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
