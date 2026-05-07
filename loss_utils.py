@@ -22,28 +22,15 @@ except:
 C1 = 0.01 ** 2
 C2 = 0.03 ** 2
 
-class FusedSSIMMap(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, C1, C2, img1, img2):
-        ssim_map = fusedssim(C1, C2, img1, img2)
-        ctx.save_for_backward(img1.detach(), img2)
-        ctx.C1 = C1
-        ctx.C2 = C2
-        return ssim_map
-
-    @staticmethod
-    def backward(ctx, opt_grad):
-        img1, img2 = ctx.saved_tensors
-        C1, C2 = ctx.C1, ctx.C2
-        grad = fusedssim_backward(C1, C2, img1, img2, opt_grad)
-        return None, None, grad, None
-
+# ============================================================
+# L1 Loss
+# ============================================================
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
-def l2_loss(network_output, gt):
-    return ((network_output - gt) ** 2).mean()
-
+# ============================================================
+# Gaussian 커널 생성
+# ============================================================
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
@@ -53,7 +40,9 @@ def create_window(window_size, channel):
     _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
     window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
     return window
-
+# ============================================================
+# SSIM 계산 함수
+# ============================================================
 def ssim(img1, img2, window_size=11, size_average=True):
     channel = img1.size(-3)
     window = create_window(window_size, channel)
@@ -85,27 +74,27 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean()
     else:
         return ssim_map.mean(1).mean(1).mean(1)
-
-
-def fast_ssim(img1, img2):
-    ssim_map = FusedSSIMMap.apply(C1, C2, img1, img2)
-    return ssim_map.mean()
-
-
+        
+# ============================================================
+# Sobel 기반 edge field 생성
+# ============================================================
 def _sobel_edge_fields(image, percentile=85.0, power=1.0):
 
-    r, g, b = image[0:1], image[1:2], image[2:3]
-    gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
+    r, g, b = image[0:1], image[1:2], image[2:3]      # RGB Channel
+    gray = 0.2989 * r + 0.5870 * g + 0.1140 * b       # grayscale 
 
+    # Create Sobel Kernel
     kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=image.device, dtype=image.dtype).view(1, 1, 3, 3)
     ky = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=image.device, dtype=image.dtype).view(1, 1, 3, 3)
 
-    gx = F.conv2d(gray.unsqueeze(0), kx, padding=1)
-    gy = F.conv2d(gray.unsqueeze(0), ky, padding=1)
-    grad_mag = torch.sqrt(gx * gx + gy * gy + 1e-12).squeeze(0).squeeze(0)
+    # Gradient 계산
+    gx = F.conv2d(gray.unsqueeze(0), kx, padding=1)   # x 방향 gradient
+    gy = F.conv2d(gray.unsqueeze(0), ky, padding=1)   # y 방향 gradient
+    grad_mag = torch.sqrt(gx * gx + gy * gy + 1e-12).squeeze(0).squeeze(0)  # gradient magnitude 계산
 
-    # GT 이미지에서 edge 강도 맵과 edge 법선(nx, ny)을 만든다.
-    # 방법 2/3 모두 동일한 edge prior를 사용한다.
+    # --------------------------------------------------------
+    # edge 강도 맵 및 edge normal 생성
+    # --------------------------------------------------------
     flat = grad_mag.reshape(-1)
     if percentile > 0.0:
         q = torch.quantile(flat, torch.clamp(torch.tensor(percentile / 100.0, device=image.device), 0.0, 1.0))
@@ -123,71 +112,34 @@ def _sobel_edge_fields(image, percentile=85.0, power=1.0):
     ny = -gy2 / gn
     return edge_w, nx, ny
 
+# ============================================================
+# Edge-aware covariance loss
+# ============================================================
+def edge_aware_covariance_loss(gt_image, xyz, scaling, rotation, radii, full_proj_transform, world_view_transform, fovx, fovy,
+    edge_percentile=85.0, edge_power=1.0, min_weight=0.0,):
 
-def edge_aware_covariance_loss(
-    gt_image,
-    xyz,
-    scaling,
-    rotation,
-    radii,
-    full_proj_transform,
-    world_view_transform,
-    fovx,
-    fovy,
-    edge_percentile=85.0,
-    edge_power=1.0,
-    min_weight=0.0,
-):
-    # 방법 2: edge 구간에서 법선 방향 투영 공분산(sigma_perp)을 줄이기 위한 손실.
-    # 학습 시 train.py에서 RGB 손실과 가중 합으로 결합된다.
-    vis = radii > 0
-    if vis.sum() == 0:
-        return torch.zeros((), device=gt_image.device)
-
+    # edge 정보 생성
     edge_w_map, edge_nx_map, edge_ny_map = _sobel_edge_fields(gt_image, percentile=edge_percentile, power=edge_power)
     h, w = edge_w_map.shape
 
-    xyz_vis = xyz[vis]
-    scaling_vis = scaling[vis]
-    rotation_vis = rotation[vis]
-    ones = torch.ones((xyz_vis.shape[0], 1), device=xyz_vis.device, dtype=xyz_vis.dtype)
-    xyz_h = torch.cat([xyz_vis, ones], dim=1)
+    ones = torch.ones((xyz.shape[0], 1), device=xyz.device, dtype=xyz.dtype)
+    xyz_h = torch.cat([xyz, ones], dim=1)
 
+    # clip space projection
     clip = xyz_h @ full_proj_transform
     clip_w = clip[:, 3]
     valid_w = clip_w.abs() > 1e-8
-    if valid_w.sum() == 0:
-        return torch.zeros((), device=gt_image.device)
 
-    safe_w = torch.where(clip_w >= 0.0, clip_w.clamp_min(1e-8), clip_w.clamp_max(-1e-8))
+    # 2D 좌표
     ndc_xy = clip[:, :2] / safe_w.unsqueeze(1)
-    in_bounds = (ndc_xy[:, 0].abs() <= 1.0) & (ndc_xy[:, 1].abs() <= 1.0)
-    valid = valid_w & in_bounds
-    if valid.sum() == 0:
-        return torch.zeros((), device=gt_image.device)
-
+    
     grid = ndc_xy[valid].view(1, -1, 1, 2)
-    sampled_w = F.grid_sample(
-        edge_w_map.view(1, 1, h, w),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    ).view(-1)
-    sampled_nx = F.grid_sample(
-        edge_nx_map.view(1, 1, h, w),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    ).view(-1)
-    sampled_ny = F.grid_sample(
-        edge_ny_map.view(1, 1, h, w),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    ).view(-1)
+    sampled_w = F.grid_sample(edge_w_map.view(1, 1, h, w), grid, mode="bilinear",
+        padding_mode="zeros",align_corners=True).view(-1)
+    sampled_nx = F.grid_sample(edge_nx_map.view(1, 1, h, w), grid, mode="bilinear",
+        padding_mode="zeros", align_corners=True).view(-1)
+    sampled_ny = F.grid_sample(edge_ny_map.view(1, 1, h, w), grid, mode="bilinear",
+        padding_mode="zeros", align_corners=True).view(-1)
 
     if min_weight > 0.0:
         keep = sampled_w >= float(min_weight)
@@ -200,6 +152,7 @@ def edge_aware_covariance_loss(
     else:
         valid_indices = None
 
+    # camera space 좌표
     view_xyz = (xyz_h @ world_view_transform)[:, :3]
     if valid_indices is not None:
         view_xyz_valid = view_xyz[valid][valid_indices]
@@ -210,6 +163,7 @@ def edge_aware_covariance_loss(
         scaling_valid = scaling_vis[valid]
         rotation_valid = rotation_vis[valid]
 
+    # z > 0 인 점만 사용
     valid_z = view_xyz_valid[:, 2] > 1e-6
     if valid_z.sum() == 0:
         return torch.zeros((), device=gt_image.device)
@@ -221,64 +175,58 @@ def edge_aware_covariance_loss(
     scaling_vis = scaling_valid[valid_z]
     rotation_vis = rotation_valid[valid_z]
 
+    # edge normal 벡터 n=(nx, ny)
     n = torch.stack([sampled_nx, sampled_ny], dim=1)
     n = n / n.norm(dim=1, keepdim=True).clamp_min(1e-6)
-
+    # 3D Gaussian의 3차원 공분산 행렬
     L = build_scaling_rotation(scaling_vis, rotation_vis)
+    # world covariance Σ_world = L Lᵀ
     cov_world = L @ L.transpose(1, 2)
-
+    # camera covariance 변환 Σ_camera = Rᵀ Σ_world R
     a = world_view_transform[:3, :3]
     cov_cam = a.transpose(0, 1).unsqueeze(0) @ cov_world @ a.unsqueeze(0)
 
+    # tangent 계산
     tan_x = torch.tan(torch.tensor(0.5 * fovx, device=xyz.device, dtype=xyz.dtype)).clamp_min(1e-6)
     tan_y = torch.tan(torch.tensor(0.5 * fovy, device=xyz.device, dtype=xyz.dtype)).clamp_min(1e-6)
     x = view_xyz[:, 0]
     y = view_xyz[:, 1]
     z = view_xyz[:, 2]
-
+    # projection Jacobian
+    # u = x / (tan_x * z), v = y / (tan_y * z)
     j = torch.zeros((view_xyz.shape[0], 2, 3), device=xyz.device, dtype=xyz.dtype)
-    j[:, 0, 0] = 1.0 / (tan_x * z)
-    j[:, 0, 2] = -x / (tan_x * z * z)
-    j[:, 1, 1] = 1.0 / (tan_y * z)
-    j[:, 1, 2] = -y / (tan_y * z * z)
-
-    cov_ndc = j @ cov_cam @ j.transpose(1, 2)
-    sigma_perp = torch.einsum("bi,bij,bj->b", n, cov_ndc, n).clamp_min(0.0)
-
+    j[:, 0, 0] = 1.0 / (tan_x * z)    # ∂u/∂x = 1 / (tan_x z)
+    j[:, 0, 2] = -x / (tan_x * z * z) # ∂u/∂z = -x / (tan_x z²)
+    j[:, 1, 1] = 1.0 / (tan_y * z)    # ∂v/∂y = 1 / (tan_y z)
+    j[:, 1, 2] = -y / (tan_y * z * z) # ∂v/∂z = -y / (tan_y z²)
+    # 2D covariance Σ₂D
+    cov_ndc = j @ cov_cam @ j.transpose(1, 2)  
+    # edge normal 방향 분산  σ⊥ = nᵀ Σ_2D n
+    sigma_perp = torch.einsum("bi,bij,bj->b", n, cov_ndc, n).clamp_min(0.0) 
+    # edge weight 적용
     weighted = sampled_w * sigma_perp
     return weighted.sum() / (sampled_w.sum() + 1e-12)
 
 
-def sample_edge_weights_for_gaussians(
-    gt_image,
-    xyz,
-    radii,
-    full_proj_transform,
-    edge_percentile=85.0,
-    edge_power=1.0,
-):
-    # 방법 3: 각 가우시안을 화면으로 투영해 edge 강도 가중치만 샘플링한다.
-    # 이 가중치로 가우시안 scale 비율을 조절해 edge-aware 렌더를 만든다.
+def sample_edge_weights_for_gaussians(gt_image,xyz,radii,
+    full_proj_transform,edge_percentile=85.0,edge_power=1.0):
+    # 1. GT 이미지로부터 Sobel 기반 edge weight map 생성
     edge_w_map, _, _ = _sobel_edge_fields(gt_image, percentile=edge_percentile, power=edge_power)
     h, w = edge_w_map.shape
-
+        
+    # 2. edge 정보 생성
     edge_weights = torch.zeros((xyz.shape[0],), device=xyz.device, dtype=xyz.dtype)
-    vis = radii > 0
-    if vis.sum() == 0:
-        return edge_weights
-
     xyz_vis = xyz[vis]
     ones = torch.ones((xyz_vis.shape[0], 1), device=xyz_vis.device, dtype=xyz_vis.dtype)
     xyz_h = torch.cat([xyz_vis, ones], dim=1)
 
+    # clip space projection
     clip = xyz_h @ full_proj_transform
     clip_w = clip[:, 3]
-    valid_w = clip_w.abs() > 1e-8
-    if valid_w.sum() == 0:
-        return edge_weights
 
     safe_w = torch.where(clip_w >= 0.0, clip_w.clamp_min(1e-8), clip_w.clamp_max(-1e-8))
     ndc_xy = clip[:, :2] / safe_w.unsqueeze(1)
+    # 화면 내부에 존재하는 Gaussian만 선택
     in_bounds = (ndc_xy[:, 0].abs() <= 1.0) & (ndc_xy[:, 1].abs() <= 1.0)
     valid = valid_w & in_bounds
     if valid.sum() == 0:
