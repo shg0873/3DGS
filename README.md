@@ -9,15 +9,9 @@
 
 ## 2) 업로드 권장 파일(내 변경분)
 
-### 새로 추가한 파일
 
-- `collect_ros2_3dgs.py`
-- `gs_collector_params.yaml`
 - `docs/ROS2_DATA_COLLECTION_KO.md`
 - `docs/edge_study12_method2_vs_method3.md`
-
-### 기존 코드에서 수정한 파일
-
 - `train.py`
 - `utils/loss_utils.py`
 
